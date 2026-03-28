@@ -16,6 +16,7 @@ warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 # 导入自定义模块
 from lib.config import load_config, as_bool
 from lib.skymail_client import init_skymail_client
+from lib.imap_client import init_imap_client
 from lib.token_manager import TokenManager
 from lib.chatgpt_client import ChatGPTClient
 from lib.oauth_client import OAuthClient
@@ -167,7 +168,6 @@ def main():
     
     print("=" * 60)
     print("  ChatGPT 批量自动注册工具 v2.0 (模块化版本)")
-    print("  使用 Skymail 临时邮箱")
     print("=" * 60)
     
     # 加载配置
@@ -179,8 +179,13 @@ def main():
     if args.no_oauth:
         config['enable_oauth'] = False
     
-    # 初始化 Skymail 客户端
-    skymail_client = init_skymail_client(config)
+    # 根据配置选择邮箱客户端：优先使用 IMAP（如 2925 邮箱），否则使用 Skymail
+    if config.get("imap_user") and config.get("imap_pass"):
+        print("  使用 IMAP 邮箱（2925 等无限邮箱）")
+        skymail_client = init_imap_client(config)
+    else:
+        print("  使用 Skymail 临时邮箱")
+        skymail_client = init_skymail_client(config)
     
     # 初始化 Token 管理器
     token_manager = TokenManager(config)
@@ -196,7 +201,10 @@ def main():
     print(f"  注册数量: {total_accounts}")
     print(f"  并发数: {max_workers}")
     print(f"  输出文件: {output_file}")
-    print(f"  Skymail API: {skymail_client.api_base}")
+    if hasattr(skymail_client, "api_base"):
+        print(f"  Skymail API: {skymail_client.api_base}")
+    elif hasattr(skymail_client, "imap_server"):
+        print(f"  IMAP 服务器: {skymail_client.imap_server}")
     print(f"  Token 目录: {token_manager.token_dir}")
     print(f"  启用 OAuth: {enable_oauth}")
     print()
