@@ -1,0 +1,23 @@
+{
+    "_comment": "将本文件复制为 config.json 并填入实际配置",
+
+    "cpa_base_url": "http://localhost:8317",
+    "cpa_token": "your_cpa_bearer_token_here",
+
+    "check_interval_seconds": 3600,
+
+    "quota_threshold": null,
+
+    "target_type": "codex",
+
+    "request_timeout": 20,
+
+    "auto_replace": true,
+
+    "max_replacements_per_run": null,
+
+    "dry_run": false,
+
+    "log_level": "INFO",
+    "log_file": ""
+}
