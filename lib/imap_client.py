@@ -17,6 +17,9 @@ _POLL_FAST_DURATION = 10
 # OpenAI 验证码邮件中已知的误判代码（非验证码的 6 位数字）
 _FALSE_POSITIVE_CODES = {"177010"}
 
+# SEARCH 命令不可用时，按序号最多获取最近几封邮件
+_FALLBACK_FETCH_LIMIT = 50
+
 
 class ImapClient:
     """通过 IMAP 协议收取验证码的邮箱客户端，支持 2925 无限别名邮箱"""
@@ -121,11 +124,17 @@ class ImapClient:
                 return code
         return None
 
-    def _search_unseen_to(self, mail, safe_email):
+    def _search_unseen_to(self, mail, safe_email, inbox_count=0):
         """
         尝试用 UNSEEN TO 搜索邮件。
         部分 IMAP 服务器（如 imap.2925.com）不支持 TO 搜索条件，此时回退到
         仅搜索 UNSEEN，再在 Python 侧按收件人过滤。
+        若 SEARCH 命令完全不被服务器识别，则最终回退到按序号获取最近邮件。
+
+        Args:
+            mail: 已完成 SELECT 的 IMAP 连接实例
+            safe_email: 已清理的目标邮箱地址
+            inbox_count: 当前收件箱邮件总数（来自 SELECT 响应），用于 SEARCH 不可用时的回退
 
         Returns:
             tuple: (mail_ids_bytes_list, use_to_filter)
@@ -139,10 +148,28 @@ class ImapClient:
         except imaplib.IMAP4.error as e:
             print(f"  ⚠️ IMAP SEARCH TO 不支持，回退到 UNSEEN 搜索: {e}")
 
-        # 回退：服务器不支持 TO 搜索条件，改为只搜索 UNSEEN
-        status, data = mail.search(None, "UNSEEN")
-        if status == "OK" and data and data[0]:
-            return data[0].split(), True
+        # 回退 1：服务器不支持 TO 搜索条件，改为只搜索 UNSEEN
+        try:
+            status, data = mail.search(None, "UNSEEN")
+            if status == "OK" and data and data[0]:
+                return data[0].split(), True
+        except imaplib.IMAP4.error as e:
+            print(f"  ⚠️ IMAP SEARCH UNSEEN 不支持，回退到 ALL 搜索: {e}")
+
+        # 回退 2：尝试搜索全部邮件
+        try:
+            status, data = mail.search(None, "ALL")
+            if status == "OK" and data and data[0]:
+                return data[0].split(), True
+        except imaplib.IMAP4.error as e:
+            print(f"  ⚠️ IMAP SEARCH ALL 不支持，回退到按序号获取邮件: {e}")
+
+        # 回退 3：SEARCH 命令完全不可用，按序号获取最近 _FALLBACK_FETCH_LIMIT 封邮件
+        if inbox_count > 0:
+            start = max(1, inbox_count - _FALLBACK_FETCH_LIMIT + 1)
+            ids = [str(i).encode() for i in range(start, inbox_count + 1)]
+            return ids, True
+
         return [], True
 
     def wait_for_verification_code(self, target_email, timeout=30, exclude_codes=None):
@@ -173,11 +200,17 @@ class ImapClient:
         while time.time() - start < timeout:
             try:
                 mail = self._connect()
-                mail.select("INBOX")
+                select_status, select_data = mail.select("INBOX")
+                inbox_count = 0
+                if select_status == "OK" and select_data and select_data[0]:
+                    try:
+                        inbox_count = int(select_data[0])
+                    except (ValueError, TypeError):
+                        pass
 
                 # 对 target_email 做基本清理，防止 IMAP 搜索字符串注入
                 safe_email = target_email.replace('"', "").replace("\\", "")
-                mail_ids, use_to_filter = self._search_unseen_to(mail, safe_email)
+                mail_ids, use_to_filter = self._search_unseen_to(mail, safe_email, inbox_count)
 
                 for mid in mail_ids:
                     if mid in seen_ids:
