@@ -115,15 +115,19 @@ class AccountReplacer:
         if token_file.exists():
             try:
                 data = json.loads(token_file.read_text(encoding="utf-8"))
+                access_token = data.get("access_token")
+                if not access_token:
+                    logger.error("token 文件 %s 中缺少有效 access_token，注册结果无效", token_file)
+                    return None
                 logger.info("注册成功，账号: %s", email)
                 return data
             except Exception as e:
                 logger.error("读取 token 文件失败 %s: %s", token_file, e)
                 return None
         else:
-            # token 文件不存在时，尝试从 token_manager 内存构造
-            logger.warning("未找到 token 文件: %s，尝试构造基本结构", token_file)
-            return {"type": "codex", "email": email, "access_token": "", "refresh_token": ""}
+            # token 文件不存在视为注册失败，避免上传无效凭证
+            logger.error("未找到 token 文件: %s，注册结果无效，终止账号替换流程", token_file)
+            return None
 
     def replace_account(self, status) -> bool:
         """

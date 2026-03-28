@@ -22,6 +22,7 @@ quarantine_manager.py - 隔离账号管理
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -169,7 +170,7 @@ def recheck_quarantine(
         subdir = quarantine_dir / subdir_name
         if not subdir.exists():
             continue
-        for json_file in sorted(subdir.glob("*.json")):
+        for json_file in sorted(p for p in subdir.iterdir() if p.is_file()):
             stats["total"] += 1
             detail = _recheck_one(json_file, subdir_name, checker, verbose)
             details.append(detail)
@@ -238,8 +239,11 @@ def _recheck_one(json_file: Path, original_reason: str, checker, verbose: bool) 
     if verbose:
         logger.debug("开始重新检测隔离账号: %s", cpa_name)
 
-    # 1. 上传 token_data 到 CPA
-    upload_ok = checker.upload_to_cpa(token_data, cpa_name)
+    # 使用唯一临时名称上传，避免与 CPA 中现有的同名凭证冲突
+    temp_name = f"_recheck_{uuid.uuid4().hex}_{cpa_name}"
+
+    # 1. 以临时名称上传 token_data 到 CPA
+    upload_ok = checker.upload_to_cpa(token_data, temp_name)
     if not upload_ok:
         logger.warning("上传隔离账号 %s 到 CPA 失败，跳过检测", cpa_name)
         return {**base_detail, "current_status": "check_error", "error": "上传 CPA 失败"}
@@ -249,11 +253,11 @@ def _recheck_one(json_file: Path, original_reason: str, checker, verbose: bool) 
     error_msg = None
 
     try:
-        # 2. 从 CPA 列表中找到刚上传的文件，取得 auth_index
+        # 2. 从 CPA 列表中找到刚上传的临时文件，取得 auth_index
         files = checker.fetch_auth_files()
-        cpa_item = next((f for f in files if f.get("name") == cpa_name), None)
+        cpa_item = next((f for f in files if f.get("name") == temp_name), None)
         if cpa_item is None:
-            error_msg = "上传后在 CPA 列表中未找到该文件"
+            error_msg = "上传后在 CPA 列表中未找到临时文件"
             logger.warning("重新检测失败: %s - %s", cpa_name, error_msg)
         else:
             # 3. 探测账号状态
@@ -283,8 +287,8 @@ def _recheck_one(json_file: Path, original_reason: str, checker, verbose: bool) 
         error_msg = str(e)
         logger.error("重新检测账号 %s 时异常: %s", cpa_name, e)
     finally:
-        # 4. 无论检测结果如何，清理 CPA 中的临时上传
-        checker.delete_from_cpa(cpa_name)
+        # 4. 无论检测结果如何，清理 CPA 中的临时上传（使用临时名称，不影响生产凭证）
+        checker.delete_from_cpa(temp_name)
 
     return {
         **base_detail,

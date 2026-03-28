@@ -32,7 +32,7 @@ def _load_monitor_config(config_path: Optional[str] = None) -> dict:
     """
     加载监控配置。
 
-    优先级：命令行指定路径 > account_monitor/config.json > 环境变量 > 默认值
+    优先级：命令行参数 > 环境变量 > account_monitor/config.json > 默认值
     """
     defaults = {
         # CPA 设置
