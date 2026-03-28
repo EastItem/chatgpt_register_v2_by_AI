@@ -16,6 +16,7 @@ warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 # 导入自定义模块
 from lib.config import load_config, as_bool
 from lib.skymail_client import init_skymail_client
+from lib.imap_client import ImapClient
 from lib.token_manager import TokenManager
 from lib.chatgpt_client import ChatGPTClient
 from lib.oauth_client import OAuthClient
@@ -49,7 +50,7 @@ def register_one_account(idx, total, skymail_client, token_manager, oauth_client
         
         try:
             # 1. 创建临时邮箱
-            print(f"{tag} 创建 Skymail 临时邮箱...")
+            print(f"{tag} 创建临时邮箱...")
             email, mail_token = skymail_client.create_temp_email()
             print(f"{tag} 邮箱: {email}")
             
@@ -179,8 +180,26 @@ def main():
     if args.no_oauth:
         config['enable_oauth'] = False
     
-    # 初始化 Skymail 客户端
-    skymail_client = init_skymail_client(config)
+    # 初始化邮箱客户端（IMAP 或 Skymail）
+    use_imap = as_bool(config.get("use_imap", False))
+    if use_imap:
+        imap_user = config.get("imap_user", "")
+        imap_pass = config.get("imap_password", "")
+        if not imap_user or not imap_pass:
+            print("❌ 错误: 启用了 use_imap 但未配置 imap_user / imap_password")
+            print("   请在 config.json 中设置 imap_user 和 imap_password")
+            sys.exit(1)
+        skymail_client = ImapClient(
+            imap_user=imap_user,
+            imap_pass=imap_pass,
+            imap_server=config.get("imap_server", "imap.2925.com"),
+            imap_port=config.get("imap_port", 993),
+            email_prefix=config.get("email_prefix", ""),
+            email_domain=config.get("email_domain", "2925.com"),
+        )
+        print(f"📧 使用 IMAP 邮箱客户端 ({config.get('imap_server', 'imap.2925.com')})")
+    else:
+        skymail_client = init_skymail_client(config)
     
     # 初始化 Token 管理器
     token_manager = TokenManager(config)
@@ -196,7 +215,10 @@ def main():
     print(f"  注册数量: {total_accounts}")
     print(f"  并发数: {max_workers}")
     print(f"  输出文件: {output_file}")
-    print(f"  Skymail API: {skymail_client.api_base}")
+    if use_imap:
+        print(f"  IMAP 服务器: {config.get('imap_server', 'imap.2925.com')}")
+    else:
+        print(f"  Skymail API: {skymail_client.api_base}")
     print(f"  Token 目录: {token_manager.token_dir}")
     print(f"  启用 OAuth: {enable_oauth}")
     print()
