@@ -676,28 +676,21 @@ class OAuthClient:
         tried_codes = set(exclude_codes)
         otp_success = False
         otp_deadline = time.time() + 30
-        
-        while time.time() < otp_deadline and not otp_success:
-            # 获取邮件列表
-            messages = skymail_client.fetch_emails(email) or []
-            candidate_codes = []
-            
-            for msg in messages[:12]:
-                content = msg.get("content") or msg.get("text") or ""
-                code = skymail_client.extract_verification_code(content)
-                if code and code not in tried_codes:
-                    candidate_codes.append(code)
-            
-            if not candidate_codes:
-                elapsed = int(30 - max(0, otp_deadline - time.time()))
-                self._log(f"OTP 等待中... ({elapsed}s/30s)")
-                time.sleep(2)
-                continue
-            
-            for otp_code in candidate_codes:
+
+        # 支持两种邮件客户端：
+        # - SkymailClient：有 fetch_emails 方法，返回邮件列表供逐条尝试
+        # - ImapClient：有 wait_for_verification_code 方法，内部轮询并直接返回验证码
+        is_imap_client = not hasattr(skymail_client, 'fetch_emails') and hasattr(skymail_client, 'wait_for_verification_code')
+
+        if is_imap_client:
+            # IMAP 模式：由 wait_for_verification_code 统一处理轮询，直接拿到验证码后提交
+            remaining = max(30, int(otp_deadline - time.time()))
+            otp_code = skymail_client.wait_for_verification_code(
+                email, timeout=remaining, exclude_codes=tried_codes
+            )
+            if otp_code:
                 tried_codes.add(otp_code)
                 self._log(f"尝试 OTP: {otp_code}")
-                
                 try:
                     kwargs = {
                         "json": {"code": otp_code},
@@ -707,7 +700,60 @@ class OAuthClient:
                     }
                     if impersonate:
                         kwargs["impersonate"] = impersonate
-                    
+                    resp_otp = self.session.post(
+                        f"{self.oauth_issuer}/api/accounts/email-otp/validate",
+                        **kwargs
+                    )
+                    self._log(f"/email-otp/validate -> {resp_otp.status_code}")
+                    if resp_otp.status_code == 200:
+                        try:
+                            otp_data = resp_otp.json()
+                        except Exception:
+                            self._log("email-otp/validate 响应解析失败")
+                        else:
+                            continue_url = otp_data.get("continue_url", "") or continue_url
+                            page_type = otp_data.get("page", {}).get("type", "") or page_type
+                            self._log(f"OTP 验证通过 page={page_type or '-'} next={continue_url[:80] if continue_url else '-'}...")
+                            otp_success = True
+                            if not hasattr(skymail_client, '_used_codes'):
+                                skymail_client._used_codes = set()
+                            skymail_client._used_codes.add(otp_code)
+                    else:
+                        self._log(f"OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
+                except Exception as e:
+                    self._log(f"email-otp/validate 异常: {e}")
+        else:
+            while time.time() < otp_deadline and not otp_success:
+                # 获取邮件列表
+                messages = skymail_client.fetch_emails(email) or []
+                candidate_codes = []
+
+                for msg in messages[:12]:
+                    content = msg.get("content") or msg.get("text") or ""
+                    code = skymail_client.extract_verification_code(content)
+                    if code and code not in tried_codes:
+                        candidate_codes.append(code)
+
+                if not candidate_codes:
+                    elapsed = int(30 - max(0, otp_deadline - time.time()))
+                    self._log(f"OTP 等待中... ({elapsed}s/30s)")
+                    time.sleep(2)
+                    continue
+
+                for otp_code in candidate_codes:
+                    tried_codes.add(otp_code)
+                    self._log(f"尝试 OTP: {otp_code}")
+
+                try:
+                    kwargs = {
+                        "json": {"code": otp_code},
+                        "headers": headers_otp,
+                        "timeout": 30,
+                        "allow_redirects": False
+                    }
+                    if impersonate:
+                        kwargs["impersonate"] = impersonate
+
                     resp_otp = self.session.post(
                         f"{self.oauth_issuer}/api/accounts/email-otp/validate",
                         **kwargs
@@ -715,34 +761,34 @@ class OAuthClient:
                 except Exception as e:
                     self._log(f"email-otp/validate 异常: {e}")
                     continue
-                
+
                 self._log(f"/email-otp/validate -> {resp_otp.status_code}")
-                
+
                 if resp_otp.status_code != 200:
                     self._log(f"OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
                     continue
-                
+
                 try:
                     otp_data = resp_otp.json()
                 except Exception:
                     self._log("email-otp/validate 响应解析失败")
                     continue
-                
+
                 continue_url = otp_data.get("continue_url", "") or continue_url
                 page_type = otp_data.get("page", {}).get("type", "") or page_type
                 self._log(f"OTP 验证通过 page={page_type or '-'} next={continue_url[:80] if continue_url else '-'}...")
                 otp_success = True
-                
+
                 # 记录已使用的验证码
                 if not hasattr(skymail_client, '_used_codes'):
                     skymail_client._used_codes = set()
                 skymail_client._used_codes.add(otp_code)
-                
+
                 break
-            
+
             if not otp_success:
                 time.sleep(2)
-        
+
         if not otp_success:
             self._log(f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码")
             return None
