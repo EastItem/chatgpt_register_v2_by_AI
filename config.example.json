@@ -1,7 +1,19 @@
 {
+    "_comment_mail": "邮箱方案二选一：Skymail 或 IMAP（如 2925.com）。设置了 imap_user+imap_pass 则优先使用 IMAP。",
+
+    "_comment_skymail": "--- Skymail 方案 ---",
     "skymail_admin_email": "admin@example.com",
     "skymail_admin_password": "your_password_here",
     "skymail_domains": [],
+
+    "_comment_imap": "--- IMAP 方案（2925.com 无限邮箱等）---",
+    "imap_user": "",
+    "imap_pass": "",
+    "imap_server": "imap.2925.com",
+    "imap_port": 993,
+    "imap_email_prefix": "",
+    "imap_email_domain": "2925.com",
+
     "proxy": "http://127.0.0.1:7890",
     "output_file": "registered_accounts.txt",
     "enable_oauth": true,
