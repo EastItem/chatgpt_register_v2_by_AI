@@ -27,6 +27,13 @@ def load_config():
         "token_json_dir": "tokens",
         "upload_api_url": "",
         "upload_api_token": "",
+        "use_imap": False,
+        "imap_server": "imap.2925.com",
+        "imap_port": 993,
+        "imap_user": "",
+        "imap_password": "",
+        "email_prefix": "",
+        "email_domain": "2925.com",
     }
 
     config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
@@ -55,14 +62,21 @@ def load_config():
         "TOKEN_JSON_DIR": "token_json_dir",
         "UPLOAD_API_URL": "upload_api_url",
         "UPLOAD_API_TOKEN": "upload_api_token",
+        "USE_IMAP": "use_imap",
+        "IMAP_SERVER": "imap_server",
+        "IMAP_PORT": "imap_port",
+        "IMAP_USER": "imap_user",
+        "IMAP_PASSWORD": "imap_password",
+        "EMAIL_PREFIX": "email_prefix",
+        "EMAIL_DOMAIN": "email_domain",
     }
 
     for env_key, config_key in env_mappings.items():
         env_value = os.environ.get(env_key)
         if env_value is not None:
-            if config_key in ["total_accounts", "concurrent_workers"]:
+            if config_key in ["total_accounts", "concurrent_workers", "imap_port"]:
                 config[config_key] = int(env_value)
-            elif config_key in ["enable_oauth", "oauth_required"]:
+            elif config_key in ["enable_oauth", "oauth_required", "use_imap"]:
                 config[config_key] = env_value.lower() in ["1", "true", "yes", "y", "on"]
             else:
                 config[config_key] = env_value
