@@ -4,7 +4,8 @@ account_replacer.py - 注册新账号并替换 CPA 中的异常账号
 流程：
 1. 调用现有注册逻辑（chatgpt_register_v2.py 的 register_one_account）
 2. 将新账号 Token JSON 上传到 CPA
-3. 从 CPA 删除旧的异常账号凭证
+3. 将旧账号凭证保存到隔离文件夹（quarantine/banned/ 或 quarantine/quota_low/）
+4. 从 CPA 删除旧账号凭证
 """
 
 import json
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from account_monitor.quarantine_manager import save_to_quarantine
 
 
 def _import_register_deps(config: dict):
@@ -56,12 +59,14 @@ class AccountReplacer:
     Args:
         main_config: 注册配置（来自 config.json）
         quota_checker: QuotaChecker 实例（用于上传/删除 CPA 凭证）
+        quarantine_dir: 隔离文件夹根目录；None 表示不隔离（直接删除）
         dry_run: True 时只模拟，不实际注册或删除
     """
 
-    def __init__(self, main_config: dict, quota_checker, dry_run: bool = False):
+    def __init__(self, main_config: dict, quota_checker, quarantine_dir: Optional[Path] = None, dry_run: bool = False):
         self.config = main_config
         self.quota_checker = quota_checker
+        self.quarantine_dir = Path(quarantine_dir) if quarantine_dir else None
         self.dry_run = dry_run
 
     def register_new_account(self) -> Optional[dict]:
@@ -120,18 +125,23 @@ class AccountReplacer:
             logger.warning("未找到 token 文件: %s，尝试构造基本结构", token_file)
             return {"type": "codex", "email": email, "access_token": "", "refresh_token": ""}
 
-    def replace_account(self, old_name: str) -> bool:
+    def replace_account(self, status) -> bool:
         """
         注册新账号并替换 CPA 中的旧账号。
 
         流程：
         1. 注册新账号
         2. 上传新账号凭证到 CPA
-        3. 删除旧账号凭证
+        3. 将旧账号保存到隔离文件夹（banned/ 或 quota_low/）
+        4. 从 CPA 删除旧账号凭证
+
+        Args:
+            status: AccountStatus 对象（包含 name, is_banned, is_quota_low 等）
 
         Returns:
             bool: 是否成功完成替换
         """
+        old_name = status.name
         logger.info("开始替换账号: %s", old_name)
 
         # 1. 注册新账号
@@ -144,16 +154,25 @@ class AccountReplacer:
         new_file_name = f"{new_email}.json"
 
         if self.dry_run:
-            logger.info("[DryRun] 跳过上传和删除操作")
+            logger.info("[DryRun] 跳过上传、隔离和删除操作")
             return True
 
         # 2. 上传新账号凭证到 CPA
         upload_ok = self.quota_checker.upload_to_cpa(new_token_data, new_file_name)
         if not upload_ok:
-            logger.error("上传新账号 %s 到 CPA 失败，不删除旧账号", new_email)
+            logger.error("上传新账号 %s 到 CPA 失败，不处理旧账号", new_email)
             return False
 
-        # 3. 删除旧账号凭证
+        # 3. 将旧账号保存到隔离文件夹（替代直接删除）
+        if self.quarantine_dir is not None:
+            token_dir = Path(self.config.get("token_json_dir", "tokens"))
+            if not token_dir.is_absolute():
+                token_dir = _REPO_ROOT / token_dir
+            save_to_quarantine(status, self.quarantine_dir, token_dir=token_dir)
+        else:
+            logger.debug("未配置 quarantine_dir，跳过隔离保存")
+
+        # 4. 从 CPA 删除旧账号凭证
         delete_ok = self.quota_checker.delete_from_cpa(old_name)
         if not delete_ok:
             logger.warning("删除旧账号 %s 失败（新账号已上传）", old_name)
@@ -163,26 +182,27 @@ class AccountReplacer:
         logger.info("账号替换完成: %s → %s", old_name, new_email)
         return True
 
-    def replace_accounts(self, names: list, max_replacements: Optional[int] = None) -> dict:
+    def replace_accounts(self, statuses: list, max_replacements: Optional[int] = None) -> dict:
         """
         批量替换异常账号。
 
         Args:
-            names: 需要替换的旧账号名列表
+            statuses: AccountStatus 对象列表
             max_replacements: 单次最多替换数量（None 表示全部替换）
 
         Returns:
             dict: {"replaced": [...], "failed": [...]}
         """
         if max_replacements is not None:
-            names = names[:max_replacements]
+            statuses = statuses[:max_replacements]
 
         replaced = []
         failed = []
 
-        for idx, name in enumerate(names):
+        for idx, status in enumerate(statuses):
+            name = status.name
             try:
-                ok = self.replace_account(name)
+                ok = self.replace_account(status)
                 if ok:
                     replaced.append(name)
                 else:
@@ -192,7 +212,7 @@ class AccountReplacer:
                 failed.append(name)
 
             # 注册之间稍作等待，避免过于频繁
-            if idx < len(names) - 1:
+            if idx < len(statuses) - 1:
                 time.sleep(2)
 
         return {"replaced": replaced, "failed": failed}

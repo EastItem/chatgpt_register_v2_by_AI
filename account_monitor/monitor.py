@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from account_monitor.quota_checker import QuotaChecker
 from account_monitor.account_replacer import AccountReplacer
+from account_monitor.quarantine_manager import recheck_quarantine
 
 
 def _load_monitor_config(config_path: Optional[str] = None) -> dict:
@@ -45,6 +46,7 @@ def _load_monitor_config(config_path: Optional[str] = None) -> dict:
         # 替换设置
         "auto_replace": True,
         "max_replacements_per_run": None,  # None 表示替换全部异常账号
+        "quarantine_dir": "",              # 隔离文件夹根目录；空字符串时使用默认路径
         "dry_run": False,
         # 日志设置
         "log_level": "INFO",
@@ -78,6 +80,7 @@ def _load_monitor_config(config_path: Optional[str] = None) -> dict:
         "REQUEST_TIMEOUT": "request_timeout",
         "AUTO_REPLACE": "auto_replace",
         "MAX_REPLACEMENTS": "max_replacements_per_run",
+        "QUARANTINE_DIR": "quarantine_dir",
         "DRY_RUN": "dry_run",
         "LOG_LEVEL": "log_level",
         "LOG_FILE": "log_file",
@@ -163,6 +166,13 @@ class AccountMonitor:
         self.cfg = monitor_config
         self.main_config = main_config
 
+        # 隔离文件夹默认为 account_monitor/quarantine/
+        quarantine_dir_cfg = self.cfg.get("quarantine_dir", "")
+        if quarantine_dir_cfg:
+            self.quarantine_dir = Path(quarantine_dir_cfg)
+        else:
+            self.quarantine_dir = Path(__file__).parent / "quarantine"
+
         checker = QuotaChecker(
             cpa_base_url=self.cfg["cpa_base_url"],
             cpa_token=self.cfg["cpa_token"],
@@ -174,6 +184,7 @@ class AccountMonitor:
         self.replacer = AccountReplacer(
             main_config=self.main_config,
             quota_checker=checker,
+            quarantine_dir=self.quarantine_dir,
             dry_run=bool(self.cfg.get("dry_run", False)),
         )
 
@@ -227,10 +238,9 @@ class AccountMonitor:
             return result
 
         max_replace = self.cfg.get("max_replacements_per_run")
-        bad_names = [s.name for s in bad_accounts]
-        logger.info("开始替换 %d 个异常账号...", len(bad_names))
+        logger.info("开始替换 %d 个异常账号...", len(bad_accounts))
 
-        replace_result = self.replacer.replace_accounts(bad_names, max_replacements=max_replace)
+        replace_result = self.replacer.replace_accounts(bad_accounts, max_replacements=max_replace)
         result["replaced"] = len(replace_result["replaced"])
         result["failed"] = len(replace_result["failed"])
         result["replaced_names"] = replace_result["replaced"]
@@ -241,6 +251,48 @@ class AccountMonitor:
             result["replaced"], result["failed"],
         )
         logger.info("=" * 50)
+        return result
+
+    def check_quarantine(self, verbose: bool = False) -> dict:
+        """
+        批量重新检测隔离文件夹中的账号状态。
+
+        扫描 quarantine/banned/ 和 quarantine/quota_low/ 中的所有文件，
+        通过 CPA 重新探测每个账号的当前状态，返回统计信息和详细结果。
+
+        Args:
+            verbose: 是否输出每个账号的详细检测日志
+
+        Returns:
+            dict: {
+                "quarantine_dir": str,
+                "stats": {
+                    "total": int,       # 扫描到的隔离文件总数
+                    "rechecked": int,   # 实际完成检测的数量
+                    "still_banned": int,
+                    "still_quota_low": int,
+                    "recovered": int,   # 已恢复正常
+                    "check_error": int, # 检测失败
+                    "no_token_data": int  # 无凭证，无法检测
+                },
+                "details": [
+                    {
+                        "file": str,
+                        "cpa_name": str,
+                        "quarantine_reason": str,
+                        "quarantine_time": str,
+                        "current_status": str,  # still_banned / still_quota_low /
+                                                # recovered / check_error / no_token_data
+                        "quota_remaining": float | None,
+                        "error": str | None
+                    },
+                    ...
+                ]
+            }
+        """
+        logger.info("开始复查隔离账号: %s", self.quarantine_dir)
+        result = recheck_quarantine(self.quarantine_dir, self.checker, verbose=verbose)
+        result["quarantine_dir"] = str(self.quarantine_dir)
         return result
 
     def run_loop(self, interval_seconds: Optional[int] = None):
@@ -297,6 +349,9 @@ def main():
 
   # 模拟运行（不实际注册和删除）
   python -m account_monitor --dry-run --once
+
+  # 复查隔离文件夹中的账号状态
+  python -m account_monitor --check-quarantine
 """,
     )
     parser.add_argument("--config", default="", help="监控配置文件路径（默认: account_monitor/config.json）")
@@ -306,6 +361,8 @@ def main():
     parser.add_argument("--quota-threshold", type=float, default=None, help="额度阈值，低于此值触发替换（默认: 不检测额度）")
     parser.add_argument("--once", action="store_true", help="仅执行一次检测后退出")
     parser.add_argument("--no-replace", action="store_true", help="只检测不替换（auto_replace=False）")
+    parser.add_argument("--check-quarantine", action="store_true", help="复查隔离文件夹中的账号状态并打印统计和明细")
+    parser.add_argument("--quarantine-dir", default="", help="隔离文件夹根目录（默认: account_monitor/quarantine/）")
     parser.add_argument("--dry-run", action="store_true", help="模拟运行，不实际注册或删除账号")
     parser.add_argument("--log-level", default="", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
     parser.add_argument("--log-file", default="", help="日志文件路径")
@@ -325,6 +382,8 @@ def main():
         monitor_cfg["quota_threshold"] = args.quota_threshold
     if args.no_replace:
         monitor_cfg["auto_replace"] = False
+    if args.quarantine_dir:
+        monitor_cfg["quarantine_dir"] = args.quarantine_dir
     if args.dry_run:
         monitor_cfg["dry_run"] = True
     if args.log_level:
@@ -345,7 +404,11 @@ def main():
 
     monitor = AccountMonitor(monitor_cfg, main_config)
 
-    if args.once:
+    if args.check_quarantine:
+        verbose = monitor_cfg.get("log_level", "INFO").upper() == "DEBUG"
+        result = monitor.check_quarantine(verbose=verbose)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.once:
         result = monitor.run_once()
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

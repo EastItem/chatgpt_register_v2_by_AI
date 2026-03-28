@@ -16,6 +16,8 @@
 
     "max_replacements_per_run": null,
 
+    "quarantine_dir": "",
+
     "dry_run": false,
 
     "log_level": "INFO",
