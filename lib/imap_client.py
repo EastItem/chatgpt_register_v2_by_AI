@@ -121,12 +121,39 @@ class ImapClient:
                 return code
         return None
 
+    def _search_unseen_to(self, mail, safe_email):
+        """
+        尝试用 UNSEEN TO 搜索邮件。
+        部分 IMAP 服务器（如 imap.2925.com）不支持 TO 搜索条件，此时回退到
+        仅搜索 UNSEEN，再在 Python 侧按收件人过滤。
+
+        Returns:
+            tuple: (mail_ids_bytes_list, use_to_filter)
+                mail_ids_bytes_list: 邮件 ID 列表（bytes）
+                use_to_filter: True 表示需要在 Python 侧过滤收件人
+        """
+        try:
+            status, data = mail.search(None, f'(UNSEEN TO "{safe_email}")')
+            if status == "OK":
+                return (data[0].split() if data and data[0] else []), False
+        except imaplib.IMAP4.error as e:
+            print(f"  ⚠️ IMAP SEARCH TO 不支持，回退到 UNSEEN 搜索: {e}")
+
+        # 回退：服务器不支持 TO 搜索条件，改为只搜索 UNSEEN
+        status, data = mail.search(None, "UNSEEN")
+        if status == "OK" and data and data[0]:
+            return data[0].split(), True
+        return [], True
+
     def wait_for_verification_code(self, target_email, timeout=30, exclude_codes=None):
         """
         连接 IMAP 服务器，轮询收件箱，查找发送给 target_email 的未读邮件并提取验证码。
 
         Args:
             target_email: 目标别名邮箱地址（用于 TO 搜索）
+                          注意：地址中的 '+' 是 RFC 5321 合法字符（子地址别名），
+                          但部分 IMAP 服务器的 SEARCH TO 条件不支持含 '+' 的地址，
+                          因此本方法在 SEARCH 失败时会自动回退到 Python 侧过滤。
             timeout: 超时时间（秒）
             exclude_codes: 要排除的验证码集合（避免重复使用旧验证码）
 
@@ -150,28 +177,36 @@ class ImapClient:
 
                 # 对 target_email 做基本清理，防止 IMAP 搜索字符串注入
                 safe_email = target_email.replace('"', "").replace("\\", "")
-                # 优先搜索收件人为 target_email 的未读邮件
-                status, data = mail.search(None, f'(UNSEEN TO "{safe_email}")')
+                mail_ids, use_to_filter = self._search_unseen_to(mail, safe_email)
 
-                if status == "OK" and data and data[0]:
-                    mail_ids = data[0].split()
-                    for mid in mail_ids:
-                        if mid in seen_ids:
+                for mid in mail_ids:
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+
+                    _, msg_data = mail.fetch(mid, "(RFC822)")
+                    for response_part in msg_data:
+                        if not isinstance(response_part, tuple):
                             continue
-                        seen_ids.add(mid)
+                        msg = email.message_from_bytes(response_part[1])
 
-                        _, msg_data = mail.fetch(mid, "(RFC822)")
-                        for response_part in msg_data:
-                            if not isinstance(response_part, tuple):
+                        # 当服务器不支持 TO 搜索时，在 Python 侧过滤收件人
+                        if use_to_filter:
+                            to_headers = [
+                                msg.get("To", ""),
+                                msg.get("Delivered-To", ""),
+                                msg.get("X-Original-To", ""),
+                            ]
+                            if not any(target_email.lower() in h.lower() for h in to_headers):
                                 continue
-                            msg = email.message_from_bytes(response_part[1])
-                            content = self._get_email_body(msg)
-                            code = self.extract_verification_code(content)
-                            if code and code not in all_exclude:
-                                self._used_codes.add(code)
-                                print(f"  ✅ 验证码: {code}")
-                                mail.logout()
-                                return code
+
+                        content = self._get_email_body(msg)
+                        code = self.extract_verification_code(content)
+                        if code and code not in all_exclude:
+                            self._used_codes.add(code)
+                            print(f"  ✅ 验证码: {code}")
+                            mail.logout()
+                            return code
 
                 mail.logout()
             except imaplib.IMAP4.error as e:
