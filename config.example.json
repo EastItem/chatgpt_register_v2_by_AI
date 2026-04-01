@@ -13,6 +13,7 @@
     "output_file": "registered_accounts.txt",
     "enable_oauth": true,
     "oauth_required": true,
+    "oauth_retry_attempts_per_account": 3,
     "oauth_issuer": "https://auth.openai.com",
     "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
     "oauth_redirect_uri": "http://localhost:1455/auth/callback",

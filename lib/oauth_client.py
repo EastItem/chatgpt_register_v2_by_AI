@@ -2,9 +2,15 @@
 OAuth 客户端模块 - 处理 Codex OAuth 登录流程
 """
 
+import base64
+import binascii
+import html
+import json
+import re
 import time
 import secrets
 from urllib.parse import urlparse, parse_qs
+from urllib.parse import unquote
 
 try:
     from curl_cffi import requests as curl_requests
@@ -367,11 +373,210 @@ class OAuthClient:
             return parse_qs(urlparse(url).query).get("code", [None])[0]
         except Exception:
             return None
+
+    def _extract_json_blobs_from_text(self, text):
+        """从 HTML/JS 文本中提取潜在 JSON 片段。"""
+        if not text:
+            return []
+
+        candidates = []
+        for pattern in (
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+            r'__NEXT_DATA__\s*=\s*(\{.*?\})\s*;',
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;',
+            r'window\.__NUXT__\s*=\s*(\{.*?\})\s*;',
+        ):
+            for match in re.findall(pattern, text, re.DOTALL | re.IGNORECASE):
+                blob = html.unescape(match).strip()
+                if blob:
+                    candidates.append(blob)
+        return candidates
+
+    def _walk_json(self, value):
+        """递归遍历 JSON 结构。"""
+        if isinstance(value, dict):
+            yield value
+            for nested in value.values():
+                yield from self._walk_json(nested)
+        elif isinstance(value, list):
+            for item in value:
+                yield from self._walk_json(item)
+
+    def _extract_first_list(self, payload, keys):
+        """递归提取指定 key 的首个非空列表。"""
+        if not payload:
+            return []
+
+        for node in self._walk_json(payload):
+            if not isinstance(node, dict):
+                continue
+            for key in keys:
+                value = node.get(key)
+                if isinstance(value, list) and value:
+                    return value
+        return []
+
+    def _extract_first_str(self, payload, keys):
+        """递归提取指定 key 的首个非空字符串。"""
+        if not payload:
+            return ""
+
+        for node in self._walk_json(payload):
+            if not isinstance(node, dict):
+                continue
+            for key in keys:
+                value = node.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return ""
+
+    def _extract_session_data_from_text(self, text):
+        """从 consent 页面文本中提取 workspace/org 会话信息。"""
+        for blob in self._extract_json_blobs_from_text(text):
+            try:
+                payload = json.loads(blob)
+            except Exception:
+                continue
+
+            workspaces = self._extract_first_list(payload, ("workspaces",))
+            if not workspaces:
+                continue
+
+            return {
+                "workspaces": workspaces,
+                "orgs": self._extract_first_list(payload, ("orgs", "organizations")),
+                "continue_url": self._extract_first_str(
+                    payload,
+                    ("continue_url", "continueUrl", "redirect_url", "redirectUrl"),
+                ),
+            }
+
+        return None
+
+    def _extract_continue_url_from_text(self, text):
+        """从 HTML/JS 文本中提取可能的下一跳 URL。"""
+        if not text:
+            return None
+
+        keywords = ("consent", "workspace", "organization", "callback", "oauth", "continue", "code=")
+        patterns = (
+            r'"continue_url"\s*:\s*"([^"]+)"',
+            r'"continueUrl"\s*:\s*"([^"]+)"',
+            r'"redirect_url"\s*:\s*"([^"]+)"',
+            r'"redirectUrl"\s*:\s*"([^"]+)"',
+            r'content=["\'][^"\']*url=([^"\']+)["\']',
+            r'location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
+            r'href=["\']([^"\']+)["\']',
+        )
+
+        for pattern in patterns:
+            for raw_url in re.findall(pattern, text, re.IGNORECASE):
+                candidate = html.unescape(raw_url).replace("\\u0026", "&").replace("\\/", "/")
+                if not candidate:
+                    continue
+                normalized = candidate.lower()
+                if not any(keyword in normalized for keyword in keywords):
+                    continue
+                if candidate.startswith("/"):
+                    return f"{self.oauth_issuer}{candidate}"
+                if candidate.startswith("http"):
+                    hostname = (urlparse(candidate).hostname or "").lower()
+                    if hostname in {"auth.openai.com", "localhost"}:
+                        return candidate
+        return None
+
+    def _extract_code_from_text(self, text):
+        """从响应文本中直接提取 authorization code。"""
+        if not text:
+            return None
+
+        direct_match = re.search(r'["\']code["\']\s*[:=]\s*["\']([^"\']+)["\']', text)
+        if direct_match and len(direct_match.group(1)) >= 12:
+            return direct_match.group(1)
+
+        url_patterns = (
+            r'https?://localhost[^\'"\s<>]+',
+            r'https?://[^\'"\s<>]*code=[^\'"\s<>]+',
+            r'["\'](/[^"\']*code=[^"\']+)["\']',
+        )
+        for pattern in url_patterns:
+            for maybe_url in re.findall(pattern, text, re.IGNORECASE):
+                url = html.unescape(maybe_url).replace("\\u0026", "&").replace("\\/", "/")
+                if url.startswith("/"):
+                    url = f"{self.oauth_issuer}{url}"
+                code = self._extract_code_from_url(url)
+                if code:
+                    return code
+        return None
+
+    def _get_response_text(self, response):
+        """安全读取响应文本。"""
+        try:
+            return response.text or ""
+        except Exception:
+            return ""
+
+    def _decode_oauth_session_value(self, raw_value):
+        """兼容不同编码方式解码 oai-client-auth-session。"""
+        if not raw_value:
+            return None
+
+        candidates = [raw_value]
+        unquoted = unquote(raw_value)
+        if unquoted != raw_value:
+            candidates.append(unquoted)
+
+        for candidate in candidates:
+            current = candidate.strip()
+            if not current:
+                continue
+
+            if current.startswith("j:"):
+                current = current[2:]
+
+            if current.startswith('"') and current.endswith('"'):
+                try:
+                    current = json.loads(current)
+                except Exception:
+                    current = current[1:-1]
+
+            if isinstance(current, str):
+                current = current.replace("\\u0026", "&").replace("\\/", "/")
+
+            if isinstance(current, str) and current.startswith("{"):
+                try:
+                    return json.loads(current)
+                except Exception:
+                    pass
+
+            if not isinstance(current, str):
+                continue
+
+            base64_candidates = [current]
+            normalized = current.replace("-", "+").replace("_", "/")
+            if normalized != current:
+                base64_candidates.append(normalized)
+
+            for encoded in base64_candidates:
+                padded = encoded + "=" * (-len(encoded) % 4)
+                try:
+                    decoded = base64.b64decode(padded).decode("utf-8")
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    continue
+
+                decoded = decoded.strip()
+                if decoded.startswith("j:"):
+                    decoded = decoded[2:]
+
+                try:
+                    return json.loads(decoded)
+                except Exception:
+                    continue
+
+        return None
     
     def _oauth_follow_for_code(self, start_url, referer, user_agent, impersonate, max_hops=16):
         """跟随 URL 获取 authorization code（手动跟随重定向）"""
-        import re
-        
         # 先检查 URL 中是否已经包含 code
         if "code=" in start_url:
             code = self._extract_code_from_url(start_url)
@@ -414,6 +619,12 @@ class OAuthClient:
             code = self._extract_code_from_url(last_url)
             if code:
                 return code, last_url
+
+            body = self._get_response_text(r)
+            body_code = self._extract_code_from_text(body)
+            if body_code:
+                self._log(f"follow[{hop+1}] 从页面内容提取到 code")
+                return body_code, last_url
             
             # 检查重定向
             if r.status_code in (301, 302, 303, 307, 308):
@@ -431,7 +642,11 @@ class OAuthClient:
                 current_url = location
                 headers["Referer"] = last_url
             else:
-                # 不是重定向，立即返回（原始代码的逻辑）
+                next_url = self._extract_continue_url_from_text(body)
+                if next_url and next_url != current_url:
+                    current_url = next_url
+                    headers["Referer"] = last_url
+                    continue
                 return None, last_url
         
         return None, last_url
@@ -439,34 +654,46 @@ class OAuthClient:
     def _oauth_submit_workspace_and_org(self, consent_url, device_id, user_agent, impersonate, max_retries=3):
         """提交 workspace 和 organization 选择（带重试）"""
         session_data = None
+        consent_page_text = ""
         
         # 尝试多次解码 cookie
         for attempt in range(max_retries):
             session_data = self._decode_oauth_session_cookie()
             if session_data:
                 break
-            
+
+            try:
+                headers = {
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": consent_url,
+                    "User-Agent": user_agent or "Mozilla/5.0",
+                }
+                kwargs = {"headers": headers, "allow_redirects": False, "timeout": 30}
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+                resp = self.session.get(consent_url, **kwargs)
+                consent_page_text = self._get_response_text(resp)
+
+                code = self._extract_code_from_text(consent_page_text)
+                if code:
+                    self._log("从 consent 页面直接提取到 code")
+                    return code
+
+                session_data = self._decode_oauth_session_cookie() or self._extract_session_data_from_text(consent_page_text)
+                if session_data:
+                    break
+            except Exception:
+                pass
+
             if attempt < max_retries - 1:
                 self._log(f"无法解码 oai-client-auth-session (尝试 {attempt + 1}/{max_retries})")
-                time.sleep(0.3)  # 短暂延迟后重试
-                
-                # 重新访问 consent URL 以确保 cookie 被设置
-                try:
-                    headers = {
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "User-Agent": user_agent or "Mozilla/5.0",
-                    }
-                    kwargs = {"headers": headers, "allow_redirects": False, "timeout": 30}
-                    if impersonate:
-                        kwargs["impersonate"] = impersonate
-                    self.session.get(consent_url, **kwargs)
-                except Exception:
-                    pass
-            else:
-                self._log("无法解码 oai-client-auth-session")
-                return None
-        
-        workspaces = session_data.get("workspaces", [])
+                time.sleep(0.3)
+
+        if not session_data:
+            self._log("无法解码 oai-client-auth-session")
+            return None
+
+        workspaces = self._extract_first_list(session_data, ("workspaces",))
         if not workspaces:
             self._log("session 中没有 workspace 信息")
             return None
@@ -520,8 +747,11 @@ class OAuthClient:
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    orgs = data.get("data", {}).get("orgs", [])
-                    continue_url = data.get("continue_url", "")
+                    orgs = self._extract_first_list(data, ("orgs", "organizations"))
+                    continue_url = self._extract_first_str(
+                        data,
+                        ("continue_url", "continueUrl", "redirect_url", "redirectUrl"),
+                    )
                     
                     if orgs:
                         org_id = (orgs[0] or {}).get("id")
@@ -568,8 +798,11 @@ class OAuthClient:
                             if r_org.status_code == 200:
                                 try:
                                     org_data = r_org.json()
-                                    org_continue_url = org_data.get("continue_url", "")
-                                    org_page = org_data.get("page", {}).get("type", "")
+                                    org_continue_url = self._extract_first_str(
+                                        org_data,
+                                        ("continue_url", "continueUrl", "redirect_url", "redirectUrl"),
+                                    )
+                                    org_page = self._extract_first_str(org_data, ("type",))
                                     self._log(f"organization/select page={org_page or '-'} continue_url={org_continue_url[:80] if org_continue_url else 'None'}...")
                                     
                                     if org_continue_url:
@@ -592,17 +825,24 @@ class OAuthClient:
                         
                 except Exception as e:
                     self._log(f"处理 workspace/select 响应异常: {e}")
+                    body_code = self._extract_code_from_text(self._get_response_text(r))
+                    if body_code:
+                        return body_code
         
         except Exception as e:
             self._log(f"workspace/select 异常: {e}")
         
+        if consent_page_text:
+            next_url = self._extract_continue_url_from_text(consent_page_text)
+            if next_url:
+                code, _ = self._oauth_follow_for_code(next_url, consent_url, user_agent, impersonate)
+                if code:
+                    return code
+
         return None
     
     def _decode_oauth_session_cookie(self):
         """解码 oai-client-auth-session cookie"""
-        import json
-        import base64
-        
         try:
             for cookie in self.session.cookies:
                 try:
@@ -610,10 +850,9 @@ class OAuthClient:
                     if name == "oai-client-auth-session":
                         value = cookie.value if hasattr(cookie, 'value') else self.session.cookies.get(name)
                         if value:
-                            # 解码 base64
-                            decoded = base64.b64decode(value).decode('utf-8')
-                            data = json.loads(decoded)
-                            return data
+                            data = self._decode_oauth_session_value(value)
+                            if data:
+                                return data
                 except Exception:
                     continue
         except Exception:
@@ -743,48 +982,47 @@ class OAuthClient:
                 for otp_code in candidate_codes:
                     tried_codes.add(otp_code)
                     self._log(f"尝试 OTP: {otp_code}")
+                    try:
+                        kwargs = {
+                            "json": {"code": otp_code},
+                            "headers": headers_otp,
+                            "timeout": 30,
+                            "allow_redirects": False
+                        }
+                        if impersonate:
+                            kwargs["impersonate"] = impersonate
 
-                try:
-                    kwargs = {
-                        "json": {"code": otp_code},
-                        "headers": headers_otp,
-                        "timeout": 30,
-                        "allow_redirects": False
-                    }
-                    if impersonate:
-                        kwargs["impersonate"] = impersonate
+                        resp_otp = self.session.post(
+                            f"{self.oauth_issuer}/api/accounts/email-otp/validate",
+                            **kwargs
+                        )
+                    except Exception as e:
+                        self._log(f"email-otp/validate 异常: {e}")
+                        continue
 
-                    resp_otp = self.session.post(
-                        f"{self.oauth_issuer}/api/accounts/email-otp/validate",
-                        **kwargs
-                    )
-                except Exception as e:
-                    self._log(f"email-otp/validate 异常: {e}")
-                    continue
+                    self._log(f"/email-otp/validate -> {resp_otp.status_code}")
 
-                self._log(f"/email-otp/validate -> {resp_otp.status_code}")
+                    if resp_otp.status_code != 200:
+                        self._log(f"OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
+                        continue
 
-                if resp_otp.status_code != 200:
-                    self._log(f"OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
-                    continue
+                    try:
+                        otp_data = resp_otp.json()
+                    except Exception:
+                        self._log("email-otp/validate 响应解析失败")
+                        continue
 
-                try:
-                    otp_data = resp_otp.json()
-                except Exception:
-                    self._log("email-otp/validate 响应解析失败")
-                    continue
+                    continue_url = otp_data.get("continue_url", "") or continue_url
+                    page_type = otp_data.get("page", {}).get("type", "") or page_type
+                    self._log(f"OTP 验证通过 page={page_type or '-'} next={continue_url[:80] if continue_url else '-'}...")
+                    otp_success = True
 
-                continue_url = otp_data.get("continue_url", "") or continue_url
-                page_type = otp_data.get("page", {}).get("type", "") or page_type
-                self._log(f"OTP 验证通过 page={page_type or '-'} next={continue_url[:80] if continue_url else '-'}...")
-                otp_success = True
+                    # 记录已使用的验证码
+                    if not hasattr(skymail_client, '_used_codes'):
+                        skymail_client._used_codes = set()
+                    skymail_client._used_codes.add(otp_code)
 
-                # 记录已使用的验证码
-                if not hasattr(skymail_client, '_used_codes'):
-                    skymail_client._used_codes = set()
-                skymail_client._used_codes.add(otp_code)
-
-                break
+                    break
 
             if not otp_success:
                 time.sleep(2)

@@ -19,6 +19,7 @@ def load_config():
         "csv_file": "registered_accounts.csv",
         "enable_oauth": True,
         "oauth_required": True,
+        "oauth_retry_attempts_per_account": 3,
         "oauth_issuer": "https://auth.openai.com",
         "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
         "oauth_redirect_uri": "http://localhost:1455/auth/callback",
@@ -54,6 +55,7 @@ def load_config():
         "CONCURRENT_WORKERS": "concurrent_workers",
         "ENABLE_OAUTH": "enable_oauth",
         "OAUTH_REQUIRED": "oauth_required",
+        "OAUTH_RETRY_ATTEMPTS_PER_ACCOUNT": "oauth_retry_attempts_per_account",
         "OAUTH_ISSUER": "oauth_issuer",
         "OAUTH_CLIENT_ID": "oauth_client_id",
         "OAUTH_REDIRECT_URI": "oauth_redirect_uri",
@@ -74,7 +76,7 @@ def load_config():
     for env_key, config_key in env_mappings.items():
         env_value = os.environ.get(env_key)
         if env_value is not None:
-            if config_key in ["total_accounts", "concurrent_workers", "imap_port"]:
+            if config_key in ["total_accounts", "concurrent_workers", "imap_port", "oauth_retry_attempts_per_account"]:
                 config[config_key] = int(env_value)
             elif config_key in ["enable_oauth", "oauth_required", "use_imap"]:
                 config[config_key] = env_value.lower() in ["1", "true", "yes", "y", "on"]

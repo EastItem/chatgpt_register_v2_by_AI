@@ -23,6 +23,20 @@ from lib.oauth_client import OAuthClient
 from lib.utils import generate_random_password, generate_random_name, generate_random_birthday
 
 
+_ACCOUNT_OUTPUT_LOCK = threading.Lock()
+
+
+def _append_account_record(output_file, email, password, status=None):
+    """线程安全地保存账号记录。"""
+    record = f"{email}----{password}"
+    if status:
+        record = f"{record}----{status}"
+
+    with _ACCOUNT_OUTPUT_LOCK:
+        with open(output_file, "a", encoding="utf-8") as f:
+            f.write(f"{record}\n")
+
+
 def register_one_account(idx, total, skymail_client, token_manager, oauth_client, config, max_retries=3):
     """
     注册单个账号的完整流程（带重试机制）
@@ -90,54 +104,58 @@ def register_one_account(idx, total, skymail_client, token_manager, oauth_client
             
             if enable_oauth:
                 print(f"{tag} 开始 OAuth 登录...")
-                
-                # 直接使用 ChatGPT 客户端的 session 进行 OAuth（关键！）
-                # 不创建新的 OAuthClient，而是复用注册时的 session
-                oauth_client_reuse = OAuthClient(config, proxy=config.get("proxy", ""), verbose=True)
-                # 在初始化后立即替换 session，保留注册时的所有 cookies
-                oauth_client_reuse.session = chatgpt_client.session
-                
-                tokens = oauth_client_reuse.login_and_get_tokens(
-                    email, password,
-                    chatgpt_client.device_id,
-                    chatgpt_client.ua,
-                    chatgpt_client.sec_ch_ua,
-                    chatgpt_client.impersonate,
-                    skymail_client
-                )
-                
+                oauth_attempts = max(1, int(config.get("oauth_retry_attempts_per_account", 3)))
+                tokens = None
+
+                for oauth_attempt in range(oauth_attempts):
+                    if oauth_attempt > 0:
+                        print(f"{tag} OAuth 重试当前账号 (尝试 {oauth_attempt + 1}/{oauth_attempts})...")
+                        time.sleep(1)
+
+                    # 直接使用 ChatGPT 客户端的 session 进行 OAuth（关键！）
+                    # 不创建新的 OAuthClient，而是复用注册时的 session
+                    oauth_client_reuse = OAuthClient(config, proxy=config.get("proxy", ""), verbose=True)
+                    # 在初始化后立即替换 session，保留注册时的所有 cookies
+                    oauth_client_reuse.session = chatgpt_client.session
+
+                    tokens = oauth_client_reuse.login_and_get_tokens(
+                        email, password,
+                        chatgpt_client.device_id,
+                        chatgpt_client.ua,
+                        chatgpt_client.sec_ch_ua,
+                        chatgpt_client.impersonate,
+                        skymail_client
+                    )
+
+                    if tokens and tokens.get("access_token"):
+                        break
+
                 if tokens and tokens.get("access_token"):
                     print(f"{tag} ✅ OAuth 成功")
                     token_manager.save_tokens(email, tokens)
-                    
+
                     # 保存账号信息
                     output_file = config.get("output_file", "registered_accounts.txt")
-                    with threading.Lock():
-                        with open(output_file, "a", encoding="utf-8") as f:
-                            f.write(f"{email}----{password}----oauth=ok\n")
-                    
+                    _append_account_record(output_file, email, password, "oauth=ok")
+
                     return True, email, password, "注册成功 + OAuth 成功"
                 else:
                     print(f"{tag} ⚠️ OAuth 失败")
+                    output_file = config.get("output_file", "registered_accounts.txt")
+                    _append_account_record(output_file, email, password, "oauth=failed")
+
                     if oauth_required:
                         # OAuth 失败但是必需的，如果还有重试机会则重试
                         if attempt < max_retries - 1:
-                            print(f"{tag} OAuth 失败，准备重试整个流程...")
+                            print(f"{tag} OAuth 失败，当前账号已保存，准备重试整个流程...")
                             continue
-                        return False, email, password, "OAuth 失败（必需）"
+                        return False, email, password, "OAuth 失败（账号已保存）"
                     else:
-                        # 保存账号信息（无 OAuth）
-                        output_file = config.get("output_file", "registered_accounts.txt")
-                        with threading.Lock():
-                            with open(output_file, "a", encoding="utf-8") as f:
-                                f.write(f"{email}----{password}----oauth=failed\n")
                         return True, email, password, "注册成功（OAuth 失败）"
             else:
                 # 不启用 OAuth，直接保存账号
                 output_file = config.get("output_file", "registered_accounts.txt")
-                with threading.Lock():
-                    with open(output_file, "a", encoding="utf-8") as f:
-                        f.write(f"{email}----{password}\n")
+                _append_account_record(output_file, email, password)
                 return True, email, password, "注册成功"
             
         except Exception as e:

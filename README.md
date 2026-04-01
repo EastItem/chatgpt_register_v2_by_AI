@@ -90,6 +90,7 @@ pip install aiohttp requests
     "output_file": "registered_accounts.txt",
     "enable_oauth": true,
     "oauth_required": true,
+    "oauth_retry_attempts_per_account": 3,
     "oauth_issuer": "https://auth.openai.com",
     "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
     "oauth_redirect_uri": "http://localhost:1455/auth/callback",
@@ -119,6 +120,7 @@ pip install aiohttp requests
 4. **enable_oauth** 和 **oauth_required**：
    - `enable_oauth`: 是否启用 OAuth 登录
    - `oauth_required`: OAuth 失败时是否视为注册失败
+   - `oauth_retry_attempts_per_account`: 同一已注册账号的 OAuth 重试次数，默认 `3`
 
 ## 使用方法
 
@@ -208,6 +210,7 @@ python cpa_utils.py --cpa-token Bearer_xxx --upload-dir ./tokens
 **IMAP 模式（推荐 2925）**：
 - 使用固定前缀 + 随机生成后缀组合别名：`prefix+<随机生成后缀>@2925.com`
 - 无需建站，利用 2925 无限别名特性接收验证码
+- 对 2925 默认优先使用 `UNSEEN` 搜索并在本地按收件人过滤，避免依赖其不稳定的 `TO` 搜索条件
 
 ### 2. 账号注册
 - 访问 ChatGPT 注册页面
@@ -226,7 +229,8 @@ python cpa_utils.py --cpa-token Bearer_xxx --upload-dir ./tokens
 ### 4. 智能重试机制
 - **TLS 错误重试**：自动重试最多 3 次
 - **Cookie 未设置重试**：重新访问 consent URL，最多 3 次
-- **整个流程重试**：OAuth 失败时重新注册，最多 3 次
+- **同号 OAuth 重试**：同一已注册账号优先重试 OAuth，减少账号浪费
+- **整个流程重试**：OAuth 失败时重新注册，最多 3 次；失败账号仍会写入输出文件并标记 `oauth=failed`
 
 ## 性能数据
 
