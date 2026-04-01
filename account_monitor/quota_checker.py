@@ -37,6 +37,12 @@ def _extract_account_id(item: dict) -> Optional[str]:
         val = item.get(key)
         if val:
             return str(val)
+    id_token = item.get("id_token")
+    if isinstance(id_token, dict):
+        for key in ("chatgpt_account_id", "chatgptAccountId", "account_id", "accountId"):
+            val = id_token.get(key)
+            if val:
+                return str(val)
     return None
 
 
@@ -47,10 +53,16 @@ def _get_item_type(item: dict) -> str:
 
 def _parse_quota_remaining(body_text: str) -> Optional[float]:
     """
-    解析 wham/usage 响应体，提取剩余额度。
+    解析 wham/usage 响应体，提取“可用于替换判断”的剩余额度。
+
+    新版 Codex usage 返回里可能同时出现：
+    - rate_limit: 周额度
+    - code_review_rate_limit: 审查额度
+
+    这里明确只读取 rate_limit，避免把审查额度误当成可用额度。
     
     返回值：
-    - float: 剩余额度（如 100.0 表示剩余 100 美元等价额度）
+    - float: 剩余额度（优先为周额度剩余百分比；兼容旧格式时也可能是旧接口额度值）
     - None: 无法解析（不影响判断，视为额度充足）
 
     CPA proxy 返回格式通常为：
@@ -72,6 +84,17 @@ def _parse_quota_remaining(body_text: str) -> Optional[float]:
     data = _safe_json(body_text)
     if not data:
         return None
+
+    weekly_remaining = _parse_weekly_rate_limit_remaining(data.get("rate_limit"))
+    if weekly_remaining is not None:
+        return weekly_remaining
+
+    rate_limit = data.get("rate_limit")
+    if isinstance(rate_limit, dict):
+        weekly_window = _find_weekly_quota_window(rate_limit)
+        weekly_remaining = _parse_window_remaining(weekly_window)
+        if weekly_remaining is not None:
+            return weekly_remaining
 
     # 尝试常见字段名
     for key in (
@@ -103,6 +126,83 @@ def _parse_quota_remaining(body_text: str) -> Optional[float]:
                         pass
 
     return None
+
+
+def _parse_weekly_rate_limit_remaining(rate_limit: Optional[dict]) -> Optional[float]:
+    if not isinstance(rate_limit, dict):
+        return None
+
+    for key in ("primary_window", "secondary_window", "weekly_window", "week_window"):
+        remaining = _parse_window_remaining(rate_limit.get(key))
+        if remaining is not None:
+            return remaining
+
+    return None
+
+
+def _find_weekly_quota_window(rate_limit: dict) -> Optional[dict]:
+    """
+    从 rate_limit 中定位“周额度”窗口，显式忽略 code review 窗口。
+    """
+    explicit_keys = (
+        "primary_window",
+        "secondary_window",
+        "weekly_window",
+        "week_window",
+        "weeklyQuotaWindow",
+        "weekly_quota_window",
+    )
+    for key in explicit_keys:
+        window = rate_limit.get(key)
+        if isinstance(window, dict):
+            return window
+
+    weekly_candidates = []
+    for key, value in rate_limit.items():
+        if not isinstance(value, dict):
+            continue
+
+        lowered_key = str(key).lower()
+        if "review" in lowered_key:
+            continue
+
+        seconds = value.get("limit_window_seconds")
+        try:
+            window_seconds = int(seconds)
+        except (TypeError, ValueError):
+            continue
+
+        if window_seconds >= 7 * 24 * 60 * 60:
+            weekly_candidates.append((window_seconds, value))
+
+    if not weekly_candidates:
+        return None
+
+    weekly_candidates.sort(key=lambda item: item[0], reverse=True)
+    return weekly_candidates[0][1]
+
+
+def _parse_window_remaining(window: Optional[dict]) -> Optional[float]:
+    if not isinstance(window, dict):
+        return None
+
+    for key in ("remaining_percent", "percent_remaining", "remaining"):
+        value = window.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+
+    used_percent = window.get("used_percent")
+    if used_percent is None:
+        return None
+
+    try:
+        return max(0.0, 100.0 - float(used_percent))
+    except (TypeError, ValueError):
+        return None
 
 
 class AccountStatus:
