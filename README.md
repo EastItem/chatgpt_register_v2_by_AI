@@ -210,7 +210,6 @@ python cpa_utils.py --cpa-token Bearer_xxx --upload-dir ./tokens
 **IMAP 模式（推荐 2925）**：
 - 使用固定前缀 + 随机生成后缀组合别名：`prefix+<随机生成后缀>@2925.com`
 - 无需建站，利用 2925 无限别名特性接收验证码
-- 对 2925 默认优先使用 `UNSEEN` 搜索并在本地按收件人过滤，避免依赖其不稳定的 `TO` 搜索条件
 
 ### 2. 账号注册
 - 访问 ChatGPT 注册页面

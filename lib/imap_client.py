@@ -141,19 +141,6 @@ class ImapClient:
                 mail_ids_bytes_list: 邮件 ID 列表（bytes）
                 use_to_filter: True 表示需要在 Python 侧过滤收件人
         """
-        prefer_python_side_filter = (
-            "2925" in (self.imap_server or "").lower()
-            or (self.email_domain or "").lower().endswith("2925.com")
-        )
-
-        if prefer_python_side_filter:
-            try:
-                status, data = mail.search(None, "UNSEEN")
-                if status == "OK" and data and data[0]:
-                    return data[0].split(), True
-            except imaplib.IMAP4.error as e:
-                print(f"  ⚠️ IMAP SEARCH UNSEEN 不支持，回退到 ALL 搜索: {e}")
-
         try:
             status, data = mail.search(None, f'(UNSEEN TO "{safe_email}")')
             if status == "OK":
